@@ -257,10 +257,9 @@ def normalize(s: str) -> str:
 
 # ============================================================
 # 3-2. 비슷한 문제 만들기
-#   - 틀린 문제와 같은 개념(틀린 핵심 단어)을 다른 모양으로 다시 묻는다.
-#   - 시험 범위 문장을 그대로 빈칸만 뚫어 내지 않고,
-#     ① AI가 새 문장으로 써 주거나(API 키가 있을 때)
-#     ② 4지선다 / O·X / 설명→용어 로 모양을 바꿔서 만든다.
+#   - 틀린 문제의 '문장'을 가지고, 빈칸이 아닌 새 객관식(4지선다)을 만든다.
+#   - 정답이 그 빈칸 단어가 되지 않도록, 문장 전체를 보기로 삼아 옳은/옳지 않은 설명을 고르게 한다.
+#   - ① API 키가 있으면 AI가 새 문장으로 쓰고, ② 없으면 문장 속 단어를 바꿔 틀린 보기를 만든다.
 #   - 내용은 항상 붙여넣은 시험 범위에서만 가져온다.
 # ============================================================
 
@@ -295,8 +294,12 @@ def pick_distractors(target: str, scores: dict, n: int = 3, avoid_text: str = ""
         and compact(target) not in compact(t)
         and compact(t) not in compact(avoid_text)
     ]
-    # 점수가 높은 단어(진짜 용어일 가능성이 큰 단어)가 훨씬 잘 뽑히도록 점수를 세제곱해서 가중치로 쓴다.
-    picked = weighted_sample(pool, [scores[t] ** 3 for t in pool], n)
+    # 진짜 용어일 가능성이 큰 단어(점수 3 이상)를 먼저 뽑고, 모자랄 때만 약한 단어로 채운다.
+    strong = [t for t in pool if scores[t] >= 3]
+    weak = [t for t in pool if scores[t] < 3]
+    picked = weighted_sample(strong, [scores[t] ** 3 for t in strong], n)
+    if len(picked) < n:
+        picked += weighted_sample(weak, [scores[t] ** 3 for t in weak], n - len(picked))
 
     # 연도는 글에 없어도 가까운 연도로 오답 보기를 만들 수 있다.
     if kind == "year" and len(picked) < n:
@@ -338,56 +341,69 @@ def fix_this_josa(text: str) -> str:
     return re.sub(r"‘이것’(은|는|이|가|을|를|과|와)(?![가-힣])", lambda m: "‘이것’" + fixed[m.group(1)], text)
 
 
-def make_similar_rule_based(q: dict, wrong_terms: list[str], sentences: list[str], scores: dict) -> dict:
-    """AI 없이 만드는 비슷한 문제. 문제 모양을 바꾸고, 가능하면 다른 문장을 쓴다."""
-    target = random.choice(wrong_terms)
-    rx = term_regex(target)
+def make_wrong_versions(sentence: str, terms: list[str], scores: dict, prefer: list[str], limit: int = 3):
+    """문장 속 단어를 같은 종류의 다른 단어로 바꾼 '틀린 문장'을 최대 limit개 만든다.
+    학생이 틀린 단어를 먼저 바꾸고, 서로 다른 단어를 골고루 바꾼다.
+    반환: [(틀린 문장, 원래 단어, 바꾼 단어), ...]"""
+    compact = lambda t: t.replace(" ", "")
+    prefer_set = {compact(p) for p in prefer}
+    ordered = sorted(terms, key=lambda t: (compact(t) not in prefer_set, -scores.get(t, 0)))
+    options = {t: pick_distractors(t, scores, n=3, avoid_text=sentence) for t in ordered}
+
+    variants, seen = [], {sentence}
+    for round_no in range(3):  # 단어마다 한 번씩 돌면서 골고루 바꾼다.
+        for t in ordered:
+            if len(variants) >= limit:
+                return variants
+            if round_no >= len(options[t]):
+                continue
+            d = options[t][round_no]
+            fake = fix_josa(term_regex(t).sub(lambda m: d, sentence), d)
+            if fake not in seen:
+                seen.add(fake)
+                variants.append((fake, t, d))
+    return variants
+
+
+def make_similar_rule_based(q: dict, wrong_terms: list[str], sentences: list[str], scores: dict):
+    """AI 없이 만드는 비슷한 문제. 빈칸 대신, 문장 전체를 보기로 쓰는 4지선다를 만든다.
+      - 옳은 설명 고르기     : 원래 문장 1개 + 단어를 바꿔 만든 틀린 문장 3개
+      - 옳지 않은 설명 고르기 : 범위의 다른 문장 3개(옳음) + 단어를 바꾼 틀린 문장 1개
+    만들 수 없으면 None."""
     original = original_sentence(q)
+    rx_map = {t: term_regex(t) for t in scores}
+    terms = find_terms(original, scores, rx_map, 2) or find_terms(original, scores, rx_map, 1)
+    variants = make_wrong_versions(original, terms, scores, wrong_terms)
+    variants = [v for v in variants if v[0] not in sentences]  # 범위에 실제로 있는 문장과 겹치면 제외
+    if not variants:
+        return None
 
-    # 같은 단어가 들어 있는 '다른' 문장이 있으면 그 문장으로 새로 출제한다.
-    others = [s for s in sentences if s != original and rx.search(s)]
-    base = random.choice(others) if others else original
+    # 범위의 다른 문장 중, 같은 단어가 들어 있는 문장을 먼저 고른다.
+    others = [s for s in sentences if s != original]
+    random.shuffle(others)
+    others.sort(key=lambda s: -sum(1 for t in terms if rx_map[t].search(s)))
 
-    distractors = pick_distractors(target, scores, avoid_text=base)
-    kinds = ["short"]
-    if distractors:
-        kinds.append("ox")
-    if len(distractors) >= 3:
-        kinds.append("choice")
-    kind = random.choice(kinds)
-
-    if kind == "choice":
-        choices = [target] + distractors[:3]
+    if len(others) >= 3 and random.random() < 0.5:
+        fake, t, d = variants[0]
+        choices = others[:3] + [fake]
         random.shuffle(choices)
         return {
             "kind": "choice",
-            "prompt": "다음 문장의 빈칸에 들어갈 말로 알맞은 것은?\n" + rx.sub("( ＿＿＿＿ )", base),
+            "prompt": "다음 중 옳지 않은 설명을 고르세요.",
             "choices": choices,
-            "answer": choices.index(target),
-            "note": f"원래 문장: {base}",
+            "answer": choices.index(fake),
+            "note": f"옳지 않은 보기는 ‘{t}’을(를) ‘{d}’(으)로 바꾼 문장이에요. 옳은 문장: {original}",
         }
 
-    if kind == "ox":
-        if random.random() < 0.5:  # 단어를 바꿔치기한 '틀린 진술'
-            fake = fix_josa(rx.sub(distractors[0], base), distractors[0])  # 바꾼 단어에 맞게 조사 수정
-            return {
-                "kind": "ox",
-                "prompt": "다음 진술이 옳으면 O, 틀리면 X를 고르세요.\n" + fake,
-                "answer": False,
-                "note": f"옳은 내용: {base}",
-            }
-        return {
-            "kind": "ox",
-            "prompt": "다음 진술이 옳으면 O, 틀리면 X를 고르세요.\n" + base,
-            "answer": True,
-            "note": f"‘{target}’에 대한 옳은 설명이에요.",
-        }
-
+    choices = [original] + [v[0] for v in variants]
+    random.shuffle(choices)
+    changes = ", ".join(f"‘{t}’→‘{d}’" for _, t, d in variants)
     return {
-        "kind": "short",
-        "prompt": "다음 설명이 가리키는 것은 무엇일까요?\n" + fix_this_josa(rx.sub("‘이것’", base)),
-        "answer": target,
-        "note": f"원래 문장: {base}",
+        "kind": "choice",
+        "prompt": "다음 중 옳은 설명을 고르세요.",
+        "choices": choices,
+        "answer": choices.index(original),
+        "note": f"틀린 보기는 문장 속 단어를 바꿔 만든 거예요. ({changes})",
     }
 
 
@@ -404,59 +420,45 @@ def get_api_key() -> str:
 
 
 def parse_ai_item(raw: str) -> dict:
-    """AI가 돌려준 JSON 글을 읽어서 문제 형식이 맞는지 검사한다."""
+    """AI가 돌려준 JSON 글을 읽어서 4지선다 형식이 맞는지 검사한다."""
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         raise ValueError("JSON 형식의 답이 아니에요")
     data = json.loads(m.group(0))
 
-    kind, prompt = data.get("kind"), str(data.get("prompt", "")).strip()
-    if kind not in ("choice", "ox", "short") or not prompt:
-        raise ValueError("문제 형식이 올바르지 않아요")
-
-    item = {"kind": kind, "prompt": prompt, "note": str(data.get("note", "")).strip()}
-    if kind == "choice":
-        choices = [str(c) for c in data.get("choices", [])]
-        answer = int(data.get("answer", -1))
-        if len(choices) != 4 or not 0 <= answer < 4:
-            raise ValueError("4지선다 형식이 올바르지 않아요")
-        item.update(choices=choices, answer=answer)
-    elif kind == "ox":
-        if not isinstance(data.get("answer"), bool):
-            raise ValueError("O/X 형식이 올바르지 않아요")
-        item["answer"] = data["answer"]
-    else:
-        answer = str(data.get("answer", "")).strip()
-        if not answer:
-            raise ValueError("정답이 비어 있어요")
-        item["answer"] = answer
-    return item
+    prompt = str(data.get("prompt", "")).strip()
+    choices = [str(c).strip() for c in data.get("choices", [])]
+    answer = int(data.get("answer", -1))
+    if data.get("kind") != "choice" or not prompt or len(choices) != 4 or not 0 <= answer < 4:
+        raise ValueError("4지선다 형식이 올바르지 않아요")
+    return {"kind": "choice", "prompt": prompt, "choices": choices, "answer": answer,
+            "note": str(data.get("note", "")).strip()}
 
 
 def make_similar_ai(source_text: str, original: str, wrong_terms: list[str], api_key: str) -> dict:
-    """Claude에게 시험 범위를 보여 주고, 같은 개념을 묻는 새 문제를 쓰게 한다."""
+    """Claude에게 시험 범위와 틀린 문장을 보여 주고, 그 문장으로 새 객관식 문제를 쓰게 한다."""
     import anthropic  # 설치되어 있지 않으면 ImportError → 자동 변형 문제로 대신한다.
 
     prompt = (
-        "너는 고등학교 시험 문제 출제자야. 아래 [시험 범위]에 있는 내용만 사용해서, "
-        "[틀린 문제]와 같은 개념을 묻는 비슷한 문제 1개를 새로 만들어 줘.\n\n"
+        "너는 고등학교 시험 문제 출제자야. 아래 [시험 범위]의 내용만 사용해서, "
+        "[틀린 문장]을 바탕으로 4지선다 객관식 문제 1개를 새로 만들어 줘.\n\n"
         "규칙:\n"
-        "- [시험 범위]의 문장을 그대로 베끼지 말고 새로운 문장으로 다시 써라.\n"
-        "- 사실은 [시험 범위]와 일치해야 하고, 범위에 없는 내용을 지어내지 마라.\n"
-        "- 형식은 choice(4지선다), ox(O/X), short(단답형) 중 하나를 골라라.\n"
+        "- 빈칸 채우기 형식은 금지. 문장 속 단어 하나를 묻지 말고, 문장이 담은 내용을 다른 각도로 묻는 "
+        "객관식으로 만들어라. (예: 옳은/옳지 않은 설명 고르기, 그 일의 배경·결과·의의, 관련 인물·사건 연결)\n"
+        f"- 정답이 [학생이 틀린 핵심 단어]({', '.join(wrong_terms)}) 자체가 되면 안 된다.\n"
+        "- 시험 범위 문장을 그대로 베끼지 말고, 보기와 발문을 새로운 문장으로 써라. "
+        "사실은 [시험 범위]와 일치해야 하고 범위에 없는 내용을 지어내지 마라.\n"
+        "- 보기는 4개이고 정답은 정확히 1개여야 한다.\n"
         "- 아래 JSON 한 개만 출력해라. 설명이나 마크다운은 쓰지 마라.\n"
-        '  choice: {"kind":"choice","prompt":"문제","choices":["보기1","보기2","보기3","보기4"],"answer":0,"note":"한 줄 해설"}\n'
-        '  ox: {"kind":"ox","prompt":"진술문","answer":true,"note":"한 줄 해설"}\n'
-        '  short: {"kind":"short","prompt":"문제","answer":"정답","note":"한 줄 해설"}\n'
-        "  (choice의 answer는 0~3 번호)\n\n"
+        '{"kind":"choice","prompt":"문제","choices":["보기1","보기2","보기3","보기4"],"answer":0,"note":"한 줄 해설"}\n'
+        "(answer는 정답 보기의 번호 0~3)\n\n"
         f"[시험 범위]\n{source_text[:6000]}\n\n"
-        f"[틀린 문제]\n{original}\n\n"
-        f"[학생이 틀린 핵심 단어]\n{', '.join(wrong_terms)}"
+        f"[틀린 문장]\n{original}"
     )
     client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=800,
+        max_tokens=900,
         messages=[{"role": "user", "content": prompt}],
     )
     raw = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
@@ -480,9 +482,14 @@ def build_similar(q: dict, flags: list[bool]) -> dict:
         item = make_similar_rule_based(
             q, wrong_terms, split_sentences(st.session_state.source), st.session_state.terms
         )
-        item["source"] = "rule"
+        if item is None:  # 문장에 바꿀 단어가 없는 경우
+            item = {"kind": "none", "source": "rule",
+                    "warn": warn or "이 문장은 자동으로 보기를 만들기 어려워요. AI 키를 넣으면 만들 수 있어요."}
+        else:
+            item["source"] = "rule"
 
-    item["warn"] = warn
+    if item["kind"] != "none":
+        item["warn"] = warn
     item["uid"] = random.randint(1, 10**9)  # 위젯 key가 겹치지 않도록
     return item
 
@@ -617,9 +624,11 @@ def check_similar(checked_key: str):
 
 
 def render_similar(rnd: int, i: int, q: dict, flags: list[bool]):
-    """틀린 문제 아래에 '비슷한 문제' 버튼과, 만들어진 비슷한 문제를 보여 준다."""
+    """틀린 문제 아래에 '비슷한 문제' 버튼과, 만들어진 객관식 문제를 보여 준다."""
     sim_key = f"{rnd}_{i}"
     item = st.session_state.similar.get(sim_key)
+    if item and item.get("kind") not in ("choice", "none"):
+        item = None  # 예전 버전에서 만든 O/X·단답형 문제는 버리고 새로 만든다.
 
     label = "🔄 비슷한 문제 풀어보기" if item is None else "🔄 다른 비슷한 문제"
     if st.button(label, key=f"sim_btn_{sim_key}", use_container_width=True):
@@ -629,37 +638,31 @@ def render_similar(rnd: int, i: int, q: dict, flags: list[bool]):
 
     if item is None:
         return
+    if item["kind"] == "none":
+        st.info(item["warn"])
+        return
 
     uid = item["uid"]
     ans_key = f"sim_ans_{sim_key}_{uid}"
     chk_key = f"sim_chk_{sim_key}_{uid}"
     checked = st.session_state.get(chk_key, False)
+    marks = "①②③④"
 
     if item.get("warn"):
         st.warning(item["warn"])
 
     with st.container(border=True):
         tag = "🤖 AI가 새로 쓴 문제" if item["source"] == "ai" else "🔧 자동 변형 문제"
-        body = esc(item["prompt"]).replace("\n", "<br>")
         st.markdown(
-            f'<div class="sim-head">{tag}<span>같은 개념 · 비슷한 유형</span></div>'
-            f'<div class="sim-text">{body}</div>',
+            f'<div class="sim-head">{tag}<span>같은 문장 · 새 객관식</span></div>'
+            f'<div class="sim-text">{esc(item["prompt"])}</div>',
             unsafe_allow_html=True,
         )
-
-        if item["kind"] == "choice":
-            st.radio(
-                "보기", [0, 1, 2, 3], index=None, key=ans_key, disabled=checked,
-                format_func=lambda k: f"{'①②③④'[k]} {item['choices'][k]}",
-                label_visibility="collapsed",
-            )
-        elif item["kind"] == "ox":
-            st.radio(
-                "O/X", ["O", "X"], index=None, key=ans_key, disabled=checked,
-                horizontal=True, label_visibility="collapsed",
-            )
-        else:
-            st.text_input("정답", key=ans_key, placeholder="정답 입력", disabled=checked)
+        st.radio(
+            "보기", list(range(len(item["choices"]))), index=None, key=ans_key, disabled=checked,
+            format_func=lambda k: f"{marks[k]} {item['choices'][k]}",
+            label_visibility="collapsed",
+        )
 
         if not checked:
             st.button(
@@ -669,21 +672,10 @@ def render_similar(rnd: int, i: int, q: dict, flags: list[bool]):
             return
 
         # ----- 정답 확인 후 -----
-        picked = st.session_state.get(ans_key)
-        if item["kind"] == "choice":
-            ok = picked == item["answer"]
-            correct_text = f"{'①②③④'[item['answer']]} {item['choices'][item['answer']]}"
-        elif item["kind"] == "ox":
-            ok = picked is not None and (picked == "O") == item["answer"]
-            correct_text = "O" if item["answer"] else "X"
-        else:
-            ok = normalize(str(picked or "")) == normalize(item["answer"])
-            correct_text = item["answer"]
-
-        if ok:
+        if st.session_state.get(ans_key) == item["answer"]:
             st.success("정답!")
         else:
-            st.error(f"오답 · 정답: {correct_text}")
+            st.error(f"오답 · 정답: {marks[item['answer']]} {item['choices'][item['answer']]}")
         if item.get("note"):
             st.markdown(f'<div class="sim-note">{esc(item["note"])}</div>', unsafe_allow_html=True)
 
@@ -737,9 +729,9 @@ include_numbers = getattr(st, "toggle", st.checkbox)("연도·숫자 포함", va
 with st.expander("🤖 AI로 비슷한 문제 만들기 (선택)"):
     st.text_input("Anthropic API 키", type="password", key="api_key_input", placeholder="sk-ant-...")
     st.caption(
-        "틀린 문제 옆의 '비슷한 문제' 버튼을 누르면, 키가 있을 땐 AI가 시험 범위를 바탕으로 새 문장으로 써 주고, "
-        "비워 두면 자동으로 모양을 바꾼 문제(4지선다·O/X·설명→용어)가 나와요. "
-        "입력한 키는 이 접속 중에만 쓰이고 화면을 닫으면 사라져요."
+        "틀린 문제 옆의 '비슷한 문제' 버튼을 누르면 그 문장으로 새 객관식 문제를 만들어요. "
+        "키가 있으면 AI가 새 문장으로 써 주고, 비워 두면 문장 속 단어를 바꿔 만든 보기로 "
+        "'옳은/옳지 않은 설명 고르기'가 나와요. 입력한 키는 이 접속 중에만 쓰이고 화면을 닫으면 사라져요."
     )
 
 if st.button("🎯 문제 만들기", type="primary", use_container_width=True):

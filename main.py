@@ -527,10 +527,19 @@ CSS = """
 .badge.ok {background: rgba(61,220,151,.16); color: #5fe9b0;}
 .badge.no {background: rgba(255,107,129,.16); color: #ff8fa1;}
 .my-ans {color: #8590a6; font-size: .85rem; margin-bottom: .3rem;}
-.sim-head {color: #c9a6ff; font-weight: 700; font-size: .88rem; margin-bottom: .35rem;}
-.sim-head span {color: #8590a6; font-weight: 500; margin-left: .4rem;}
-.sim-text {color: #e8ecf4; line-height: 1.9; font-size: 1.02rem; margin-bottom: .4rem;}
-.sim-note {color: #8590a6; font-size: .85rem; margin-top: .2rem;}
+.sim-head {color: #d6b8ff; font-weight: 700; font-size: .92rem; margin-bottom: .35rem;}
+.sim-head span {color: #aab4c8; font-weight: 500; margin-left: .4rem;}
+.sim-text {color: #f4f6fb; line-height: 1.9; font-size: 1.08rem; font-weight: 600; margin-bottom: .5rem;}
+.sim-note {color: #c3cbdc; font-size: .9rem; line-height: 1.7; margin-top: .4rem;}
+
+/* 비슷한 문제의 보기(라디오): 글씨를 밝게, 채점 후(비활성)에도 흐려지지 않게 */
+div[data-testid="stRadio"] label,
+div[data-testid="stRadio"] label * {color: #f4f6fb !important; opacity: 1 !important;}
+div[data-testid="stRadio"] label {
+  background: rgba(124,156,255,.08); border: 1px solid rgba(124,156,255,.22);
+  border-radius: 10px; padding: .55rem .85rem; margin-bottom: .4rem; width: 100%;}
+div[data-testid="stRadio"] label:hover {background: rgba(124,156,255,.16);}
+div[data-testid="stRadio"] label p {font-size: 1.02rem; line-height: 1.75; font-weight: 500;}
 .hint {margin: .1rem 0 .35rem; padding: .25rem .6rem; border-radius: 8px; font-size: .88rem;
   background: rgba(255,200,87,.12); color: #ffd98a; letter-spacing: .06em;}
 

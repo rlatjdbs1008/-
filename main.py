@@ -286,6 +286,8 @@ CSS = """
 .badge.ok {background: rgba(61,220,151,.16); color: #5fe9b0;}
 .badge.no {background: rgba(255,107,129,.16); color: #ff8fa1;}
 .my-ans {color: #8590a6; font-size: .85rem; margin-bottom: .3rem;}
+.hint {margin: .1rem 0 .35rem; padding: .25rem .6rem; border-radius: 8px; font-size: .88rem;
+  background: rgba(255,200,87,.12); color: #ffd98a; letter-spacing: .06em;}
 
 .blank {display: inline-block; min-width: 3.4rem; padding: 0 .55rem; margin: 0 .15rem;
   border-bottom: 2px solid #7c9cff; background: rgba(124,156,255,.16); color: #b9c8ff;
@@ -331,6 +333,38 @@ def question_html(q: dict, flags: list[bool] | None) -> str:
 # 5. 버튼 콜백
 # ============================================================
 
+CHOSUNG = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+
+
+def hint_text(answer: str, level: int) -> str:
+    """정답으로 힌트 문구를 만든다.
+    1단계: 글자 수 + 초성   (예: 통치 → 2글자 · ㅌㅊ)
+    2단계: 첫 글자까지 공개 (예: 통치 → 2글자 · 통ㅊ)
+    숫자·영어는 정답이 그대로 드러나지 않게 ○로 가린다."""
+    shown, first_done = [], False
+    for ch in answer:
+        if ch == " ":
+            shown.append(" ")
+            continue
+        if "가" <= ch <= "힣":
+            masked = CHOSUNG[(ord(ch) - 0xAC00) // 588]  # 한글 글자 → 초성
+        elif ch == "·":
+            masked = ch
+        else:
+            masked = "○"
+        if level >= 2 and not first_done:
+            masked = ch  # 2단계에서는 첫 글자를 그대로 보여 준다
+        first_done = True
+        shown.append(masked)
+    return f"{len(answer.replace(' ', ''))}글자 · {''.join(shown)}"
+
+
+def use_hint(key: str):
+    """힌트 버튼을 누르면 단계가 한 칸 올라간다. (최대 2단계)"""
+    hints = st.session_state.hints
+    hints[key] = min(2, hints.get(key, 0) + 1)
+
+
 def load_example():
     st.session_state["source_text"] = EXAMPLE_TEXT
 
@@ -352,11 +386,12 @@ def retry_wrong(wrong_questions):
 st.set_page_config(page_title="빈칸 문제 생성기", page_icon="📝")
 st.markdown(CSS, unsafe_allow_html=True)
 
-if "questions" not in st.session_state:
-    st.session_state.questions = []
-    st.session_state.terms = {}
-    st.session_state.round = 0
-    st.session_state.graded = False
+# 값마다 따로 초기화한다. (예전 버전 세션이 남아 있어도 오류가 나지 않도록)
+st.session_state.setdefault("questions", [])
+st.session_state.setdefault("terms", {})
+st.session_state.setdefault("round", 0)
+st.session_state.setdefault("graded", False)
+st.session_state.setdefault("hints", {})  # {"라운드_문제번호_빈칸번호": 힌트 단계(0~2)}
 
 st.markdown(
     """
@@ -385,7 +420,8 @@ st.markdown('<div class="step"><span>2</span>문제 설정</div>', unsafe_allow_
 col1, col2, col3 = st.columns([2, 2, 1.4])
 num_questions = col1.slider("문제 수", 1, 30, 10)
 blanks_per_q = col2.slider("문장당 빈칸 수", 1, 3, 1)
-include_numbers = col3.toggle("연도·숫자 포함", value=True)
+# st.toggle은 비교적 최신 기능이라, 없는 버전에서는 체크박스로 대신한다.
+include_numbers = getattr(st, "toggle", st.checkbox)("연도·숫자 포함", value=True)
 
 if st.button("🎯 문제 만들기", type="primary", use_container_width=True):
     if not text.strip():
@@ -411,7 +447,7 @@ if questions:
 
     # 자동으로 찾은 핵심 단어 보여 주기
     with st.expander("🔍 자동으로 찾은 핵심 단어 보기"):
-        top_terms = sorted(st.session_state.terms.items(), key=lambda kv: -kv[1])[:40]
+        top_terms = sorted(st.session_state.get("terms", {}).items(), key=lambda kv: -kv[1])[:40]
         chips = "".join(f'<span class="chip">{esc(t)}<small>{sc}</small></span>' for t, sc in top_terms)
         st.markdown(chips, unsafe_allow_html=True)
         st.caption("숫자는 중요도 점수예요. 점수가 높은 단어가 빈칸으로 더 자주 나와요.")
@@ -430,10 +466,15 @@ if questions:
 
     if graded:
         pct = round(score / len(questions) * 100)
+        # 이번 라운드에서 힌트를 누른 횟수
+        hints_used = sum(
+            level for key, level in st.session_state.hints.items() if key.startswith(f"{rnd}_")
+        )
+        hint_note = f" · 힌트 {hints_used}번 사용" if hints_used else " · 힌트 없이 풀었어요"
         st.markdown(
             f'<div class="score-card"><div class="score-num">{score}'
             f'<span> / {len(questions)}</span></div>'
-            f'<div class="score-sub">정답률 {pct}%</div></div>',
+            f'<div class="score-sub">정답률 {pct}%{hint_note}</div></div>',
             unsafe_allow_html=True,
         )
         st.progress(score / len(questions))
@@ -459,6 +500,24 @@ if questions:
                     placeholder="정답 입력",
                     disabled=graded,
                 )
+
+                # 힌트: 누를 때마다 1단계(초성) → 2단계(첫 글자) 순서로 공개
+                hint_key = f"{rnd}_{i}_{j}"
+                level = st.session_state.hints.get(hint_key, 0)
+                if level > 0:
+                    col.markdown(
+                        f'<div class="hint">💡 {esc(hint_text(q["answers"][j], level))}</div>',
+                        unsafe_allow_html=True,
+                    )
+                if not graded:
+                    col.button(
+                        "💡 힌트" if level == 0 else ("💡 힌트 더 보기" if level == 1 else "힌트 끝"),
+                        key=f"hint_{hint_key}",
+                        on_click=use_hint,
+                        args=(hint_key,),
+                        disabled=(level >= 2),
+                        use_container_width=True,
+                    )
 
             if graded and not all(flags):
                 mine = ", ".join(u if u.strip() else "(빈칸)" for u in user_answers)

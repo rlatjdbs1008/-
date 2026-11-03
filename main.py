@@ -283,8 +283,9 @@ def term_kind(term: str) -> str:
     return "word"
 
 
-def pick_distractors(target: str, scores: dict, n: int = 3) -> list[str]:
-    """정답과 같은 종류의 다른 핵심 단어를 오답 보기로 뽑는다."""
+def pick_distractors(target: str, scores: dict, n: int = 3, avoid_text: str = "") -> list[str]:
+    """정답과 같은 종류의 다른 핵심 단어를 오답 보기로 뽑는다.
+    avoid_text(문제 문장)에 이미 들어 있는 단어는 오답 보기로 쓰지 않는다."""
     compact = lambda s: s.replace(" ", "")
     kind = term_kind(target)
     pool = [
@@ -292,10 +293,10 @@ def pick_distractors(target: str, scores: dict, n: int = 3) -> list[str]:
         if term_kind(t) == kind
         and compact(t) not in compact(target)
         and compact(target) not in compact(t)
+        and compact(t) not in compact(avoid_text)
     ]
-    strong = [t for t in pool if scores[t] >= 2]
-    pool = strong if len(strong) >= n else pool  # 가능하면 점수 높은 단어로
-    picked = weighted_sample(pool, [scores[t] for t in pool], n)
+    # 점수가 높은 단어(진짜 용어일 가능성이 큰 단어)가 훨씬 잘 뽑히도록 점수를 세제곱해서 가중치로 쓴다.
+    picked = weighted_sample(pool, [scores[t] ** 3 for t in pool], n)
 
     # 연도는 글에 없어도 가까운 연도로 오답 보기를 만들 수 있다.
     if kind == "year" and len(picked) < n:
@@ -331,6 +332,12 @@ def fix_josa(text: str, word: str) -> str:
     return re.sub(re.escape(word) + r"(은|는|이|가|을|를|과|와)(?![가-힣])", repl, text)
 
 
+def fix_this_josa(text: str) -> str:
+    """‘이것’은 받침이 있으므로 뒤에 오는 조사를 은/이/을/과로 맞춘다."""
+    fixed = {"은": "은", "는": "은", "이": "이", "가": "이", "을": "을", "를": "을", "과": "과", "와": "과"}
+    return re.sub(r"‘이것’(은|는|이|가|을|를|과|와)(?![가-힣])", lambda m: "‘이것’" + fixed[m.group(1)], text)
+
+
 def make_similar_rule_based(q: dict, wrong_terms: list[str], sentences: list[str], scores: dict) -> dict:
     """AI 없이 만드는 비슷한 문제. 문제 모양을 바꾸고, 가능하면 다른 문장을 쓴다."""
     target = random.choice(wrong_terms)
@@ -341,7 +348,7 @@ def make_similar_rule_based(q: dict, wrong_terms: list[str], sentences: list[str
     others = [s for s in sentences if s != original and rx.search(s)]
     base = random.choice(others) if others else original
 
-    distractors = pick_distractors(target, scores)
+    distractors = pick_distractors(target, scores, avoid_text=base)
     kinds = ["short"]
     if distractors:
         kinds.append("ox")
@@ -362,7 +369,7 @@ def make_similar_rule_based(q: dict, wrong_terms: list[str], sentences: list[str
 
     if kind == "ox":
         if random.random() < 0.5:  # 단어를 바꿔치기한 '틀린 진술'
-            fake = rx.sub(distractors[0], base)
+            fake = fix_josa(rx.sub(distractors[0], base), distractors[0])  # 바꾼 단어에 맞게 조사 수정
             return {
                 "kind": "ox",
                 "prompt": "다음 진술이 옳으면 O, 틀리면 X를 고르세요.\n" + fake,
@@ -378,7 +385,7 @@ def make_similar_rule_based(q: dict, wrong_terms: list[str], sentences: list[str
 
     return {
         "kind": "short",
-        "prompt": "다음 설명이 가리키는 것은 무엇일까요?\n" + rx.sub("‘이것’", base),
+        "prompt": "다음 설명이 가리키는 것은 무엇일까요?\n" + fix_this_josa(rx.sub("‘이것’", base)),
         "answer": target,
         "note": f"원래 문장: {base}",
     }
